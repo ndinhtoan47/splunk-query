@@ -70,7 +70,8 @@ permissions instead of working around it.
 ## Workflow
 
 1. **Notes.** Run `notes show <key words>`. A matching note is a search that already
-   answered this kind of question on this instance; reuse it and fill its params.
+   answered this kind of question on this instance; reuse it, fill its params, and set its
+   `earliest=`/`latest=` to the window the user asked for.
 2. **Team knowledge.** Run `knowledge <key words>` (try stems: `error`, `login`,
    `purchase`). Read a macro with `macro`, a dashboard's searches with `dashboard`.
    Prefer an existing saved search, macro or dashboard panel over new SPL: it encodes the
@@ -78,19 +79,23 @@ permissions instead of working around it.
 3. **Explore** when nothing fits: follow `reference/discovery.md` (indexes, sourcetypes,
    fields, a sample, then the aggregate). Keep every discovery search cheap and bounded.
 4. **Params and time.** Ask the user for ids you can't find; never guess one. Take the time
-   range from the question. If nothing in the conversation sets one, ask.
+   range from the question. If nothing in the conversation sets one, ask. Search exactly
+   that window: don't widen it to fit a comparison into one search (run the comparison
+   window as its own search) or because a note or saved search uses another range.
 5. **Run narrow first** (short range, `stats`, `head`), then widen. See
    `reference/spl-patterns.md`.
 6. **Check before "nothing found".** Zero rows can mean a wrong index, field name or time
    range. Confirm the field exists in that window before telling the user there are none.
 7. **Report.** Findings first: numbers with their denominator, and a comparison (previous
-   window or version). Then the queries (see "Showing the queries"), each with where it came
-   from: a note, a saved search or macro, or explored now.
+   window or version) from its own search. If a search covered a different window than the
+   user asked for, say so first and why. Then the queries (see "Showing the queries"),
+   each with where it came from: a note, a saved search or macro, or explored now.
 8. **Save what worked.** When a search answered the question and its fields were confirmed
    (it ran, the rows made sense, or the user agreed), save it:
    `notes add --title ... --spl ... --use-when ... --params ... --read-it ...`. Put the time
-   range inline, and write ids as `<USER_ID>`-style placeholders, never real values. Tell
-   the user you saved it. When a note turns out wrong, fix it with `--replace` or remove it.
+   range the question asked for inline, and write ids as `<USER_ID>`-style placeholders,
+   never real values. Tell the user you saved it. When a note turns out wrong, fix it with
+   `--replace` or remove it.
 
 ## Notes file
 
