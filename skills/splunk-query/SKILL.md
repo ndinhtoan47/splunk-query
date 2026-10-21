@@ -2,7 +2,7 @@
 name: splunk-query
 description: >-
   Run and interpret Splunk searches from the terminal through a saved browser session (SSO or
-  Splunk login) and a headless Chrome. Use whenever the user wants to query or check Splunk,
+  Splunk login) and a headless browser. Use whenever the user wants to query or check Splunk,
   search logs or events, find the top errors, look up what a user id or session id did,
   count users or failures after a release, check a deployment, write or fix SPL, explain a
   Splunk macro, saved search or dashboard, or says "query splunk", "check splunk", "search
@@ -33,6 +33,7 @@ python3 $S query '<SPL>' --format table --count 20
 python3 $S batch <file.json> --param K=V ...  # several named searches in one session
 python3 $S notes add --title '...' --spl '<SPL with earliest=>' --use-when '...' --read-it '...'
 python3 $S notes remove <title>
+python3 $S setup                              # first run: installs what is missing
 python3 $S doctor                             # setup and network check, no window
 python3 $S check | login | logout [--all]
 python3 $S configure --url '<URL the user gives>'
@@ -49,13 +50,22 @@ Options for `query` and `batch`:
 `batch` takes a JSON file of named searches (see "Batch files" in
 `reference/spl-patterns.md`). It runs up to 4 jobs at once in one browser session.
 
-First use: when a command exits 5 (not configured), ask the user for their Splunk URL. Any
-URL copied from their browser's Splunk tab works; `configure` takes the instance, app and
-locale from it. Don't guess a URL or take one from elsewhere.
+## First use
 
-Codex: the runner launches Chrome, needs network access to Splunk and the sign-in page, and
-writes to `~/.cache/splunk-query/` and `~/.config/splunk-query/`. If the sandbox blocks any of
-that, rerun the same command with escalated permissions instead of working around it.
+- **Exit 6 (setup needed):** tell the user in one line what `setup` does, then run
+  `python3 $S setup` and retry the command. Setup installs Playwright into a private Python
+  environment (`~/.cache/splunk-query/venv`). It uses Google Chrome or Microsoft Edge if
+  installed, and otherwise downloads Playwright's Chromium (about 150 MB). It is safe to run
+  again. To force a browser: `setup --browser chrome|msedge|chromium`.
+- **Exit 5 (not configured):** ask the user for their Splunk URL. Any URL copied from their
+  browser's Splunk tab works; `configure --url '<URL>'` (or `setup --url '<URL>'`) takes the
+  instance, app and locale from it. Don't guess a URL or take one from elsewhere.
+- The first search then opens a browser window once for the login.
+
+Codex: the runner launches a browser, needs network access to Splunk and the sign-in page,
+and writes to `~/.cache/splunk-query/` and `~/.config/splunk-query/`; `setup` also downloads
+packages. If the sandbox blocks any of that, rerun the same command with escalated
+permissions instead of working around it.
 
 ## Workflow
 
@@ -127,26 +137,27 @@ Progress, links and errors go to stderr prefixed `[splunk]`; results go to stdou
 | 0 | Results printed | Summarize them and show the queries |
 | 2 | Search rejected, failed, timed out, or no time range | Show the Splunk message, then fix the SPL, narrow the range, or ask for the time range |
 | 3 | Splunk or the sign-in page unreachable | Tell the user, in their language, to check the VPN or network and say when to retry. Don't retry before they confirm |
-| 4 | Interactive login needed or failed, or the session belongs to another instance | Tell the user a Chrome window will open, run `login`, wait for it |
+| 4 | Interactive login needed or failed, or the session belongs to another instance | Tell the user a browser window will open, run `login`, wait for it |
 | 5 | Not configured | Ask the user for their Splunk URL and run `configure` |
+| 6 | Setup needed: Playwright or a usable browser missing | Run `setup` (see "First use"), then retry |
 | 1 | Unexpected error | Show the message; run `doctor` |
 
-Re-login order: saved cookies, then silent SSO in the background, then a visible Chrome
+Re-login order: saved cookies, then silent SSO in the background, then a visible browser
 window where the user logs in (and approves MFA if asked). When the runner logs "Opening a
-Chrome window", tell the user to finish the login there.
+browser window", tell the user to finish the login there. If a company SSO rejects
+Playwright's Chromium (device checks), run `setup --browser chrome` or `--browser msedge`.
 
 ## Safety
 
-- Never print, cat or copy `~/.cache/splunk-query/storage_state.json` or the
-  `chrome-profile` folder: they hold live session cookies.
+- Never print, cat or copy `~/.cache/splunk-query/storage_state.json` or the `*-profile`
+  folders there: they hold live session cookies.
 - Splunk data can hold user ids, purchases and device data. Keep results local, don't paste
   them into external services, and summarize rather than dump raw events.
 - Don't post results to chat tools or ticket systems yourself. Draft the text if asked.
 
 ## Requirements
 
-Google Chrome, Python 3.9+ with `playwright` (`python3 -m pip install --user playwright`;
-no browser download needed), and network access to the Splunk instance. `doctor` checks
-all of it. Settings: `~/.config/splunk-query/config.json` (or `SPLUNK_QUERY_URL`,
-`SPLUNK_QUERY_APP`, `SPLUNK_QUERY_LOCALE`). Session: `~/.cache/splunk-query/` (or
-`SPLUNK_QUERY_HOME`).
+Python 3.9+ and network access to the Splunk instance. `setup` installs the rest; `doctor`
+checks all of it. Settings: `~/.config/splunk-query/config.json` (or `SPLUNK_QUERY_URL`,
+`SPLUNK_QUERY_APP`, `SPLUNK_QUERY_LOCALE`, `SPLUNK_QUERY_BROWSER`). Session and the private
+Python environment: `~/.cache/splunk-query/` (or `SPLUNK_QUERY_HOME`).

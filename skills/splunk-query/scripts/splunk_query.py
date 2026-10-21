@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run Splunk searches through a saved browser session (SSO or Splunk login) and a headless Chrome.
+"""Run Splunk searches through a saved browser session (SSO or Splunk login) and a headless browser.
 
 Commands:
+  setup            install what the runner needs (Playwright, and Chromium if no Chrome or Edge)
   configure        save the Splunk URL, default app and locale
-  doctor           check Python, Playwright, Chrome, config and network (never opens a window)
+  doctor           check Python, Playwright, browser, config and network (never opens a window)
   query "<SPL>"    run one search and print the results
   batch FILE       run a JSON list of named searches in one browser session
   knowledge WORDS  find saved searches, macros, event types and dashboards matching words
@@ -15,23 +16,30 @@ Commands:
   logout           delete the saved session (--all also deletes the browser profile)
 
 Exit codes: 0 ok, 1 other error, 2 search rejected/failed, 3 Splunk or sign-in page unreachable
-(VPN/network), 4 login needed/failed, 5 not configured.
+(VPN/network), 4 login needed/failed, 5 not configured, 6 setup needed (run setup).
 """
 import argparse
 import csv
+import glob
 import importlib.util
 import json
 import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
 from urllib.parse import quote, urlencode, urlparse
 
-EXIT_ERROR, EXIT_SEARCH, EXIT_VPN, EXIT_LOGIN, EXIT_CONFIG = 1, 2, 3, 4, 5
+EXIT_ERROR, EXIT_SEARCH, EXIT_VPN, EXIT_LOGIN, EXIT_CONFIG, EXIT_SETUP = 1, 2, 3, 4, 5, 6
+BROWSERS = ("chrome", "msedge", "chromium")
+BROWSER_NAMES = {"chrome": "Google Chrome", "msedge": "Microsoft Edge", "chromium": "Playwright Chromium"}
+# chrome-profile and chrome-profile-chromium keep the folder names earlier versions used.
+PROFILE_NAMES = {"chrome": "chrome-profile", "msedge": "msedge-profile", "chromium": "chrome-profile-chromium"}
+PLAYWRIGHT_REQUIREMENT = "playwright==1.60.0"
 DEFAULT_APP = "search"
 DEFAULT_LOCALE = "en-US"
 DEFAULT_COUNT = 100
@@ -108,8 +116,16 @@ def state_file():
     return os.path.join(state_dir(), "storage_state.json")
 
 
-def profile_dir():
-    return os.path.join(state_dir(), "chrome-profile")
+def profile_dir(browser="chrome"):
+    return os.path.join(state_dir(), PROFILE_NAMES[browser])
+
+
+def venv_dir():
+    return os.path.join(state_dir(), "venv")
+
+
+def venv_python():
+    return os.path.join(venv_dir(), *(("Scripts", "python.exe") if os.name == "nt" else ("bin", "python3")))
 
 
 def instance_file():
@@ -125,7 +141,7 @@ def load_playwright():
     try:
         from playwright.sync_api import Error, TimeoutError, sync_playwright
     except ImportError:
-        raise Fail(EXIT_ERROR, "Python package 'playwright' is missing. Install it: python3 -m pip install --user playwright")
+        raise Fail(EXIT_SETUP, "Playwright is not installed for this Python. Run: python3 splunk_query.py setup")
     PwError, PwTimeout = Error, TimeoutError
     return sync_playwright
 
@@ -181,6 +197,16 @@ def read_config_file():
     except ValueError:
         raise Fail(EXIT_CONFIG, "Config file %s is not valid JSON; run configure again." % path)
     return data if isinstance(data, dict) else {}
+
+
+def write_config(data):
+    path = config_path()
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
 
 
 def check_app(app):
@@ -367,16 +393,56 @@ class Session:
         raise Fail(EXIT_LOGIN, "Login not finished within %ds." % timeout)
 
 
+def browser_installed(name):
+    """Best-effort check without launching; Playwright locates the real executable at launch."""
+    if name == "chromium":
+        default = {"darwin": "~/Library/Caches/ms-playwright",
+                   "win32": os.path.join(os.environ.get("LOCALAPPDATA", "~"), "ms-playwright")}
+        root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or default.get(sys.platform, "~/.cache/ms-playwright")
+        return bool(glob.glob(os.path.join(os.path.expanduser(root), "chromium-*")))
+    apps, commands, windows = {
+        "chrome": (["/Applications/Google Chrome.app", "~/Applications/Google Chrome.app"],
+                   ["google-chrome", "google-chrome-stable"], ["Google\\Chrome\\Application\\chrome.exe"]),
+        "msedge": (["/Applications/Microsoft Edge.app", "~/Applications/Microsoft Edge.app"],
+                   ["microsoft-edge", "microsoft-edge-stable"], ["Microsoft\\Edge\\Application\\msedge.exe"]),
+    }[name]
+    if any(os.path.exists(os.path.expanduser(a)) for a in apps) or any(shutil.which(c) for c in commands):
+        return True
+    bases = [os.environ.get(v) for v in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")]
+    return any(base and os.path.exists(os.path.join(base, w)) for base in bases for w in windows)
+
+
+def configured_browser():
+    value = (os.environ.get("SPLUNK_QUERY_BROWSER") or read_config_file().get("browser") or "auto").lower()
+    if value not in BROWSERS + ("auto",):
+        raise Fail(EXIT_CONFIG, "Unknown browser %r; use auto, chrome, msedge or chromium." % value)
+    return value
+
+
+def browser_order():
+    choice = configured_browser()
+    if choice != "auto":
+        return [choice]
+    return [b for b in BROWSERS if browser_installed(b)] or ["chromium"]
+
+
 def launch(pw, headless):
-    """Open the one persistent profile shared by headless runs and the login window."""
+    """Open the persistent profile of the first browser that starts; headless runs and the login window share it."""
     os.makedirs(state_dir(), mode=0o700, exist_ok=True)
-    try:
-        return pw.chromium.launch_persistent_context(profile_dir(), channel="chrome", headless=headless)
-    except PwError as exc:
-        if "ProcessSingleton" in str(exc) or "SingletonLock" in str(exc):
-            raise Fail(EXIT_ERROR, "Chrome profile %s is in use by another splunk_query run; wait and retry." % profile_dir())
-        # Bundled Chromium is older than Chrome and cannot open a profile Chrome already upgraded.
-        return pw.chromium.launch_persistent_context(profile_dir() + "-chromium", headless=headless)
+    problems = []
+    for browser in browser_order():
+        options = {"headless": headless}
+        if browser != "chromium":
+            options["channel"] = browser
+        try:
+            return pw.chromium.launch_persistent_context(profile_dir(browser), **options)
+        except PwError as exc:
+            if "ProcessSingleton" in str(exc) or "SingletonLock" in str(exc):
+                raise Fail(EXIT_ERROR, "Browser profile %s is in use by another splunk_query run; wait and retry."
+                           % profile_dir(browser))
+            problems.append("%s: %s" % (BROWSER_NAMES[browser], str(exc).splitlines()[0]))
+            log("%s did not start." % BROWSER_NAMES[browser])
+    raise Fail(EXIT_SETUP, "No browser could start (%s). Run: python3 splunk_query.py setup" % "; ".join(problems))
 
 
 def open_session(pw, cfg, app, interactive, login_timeout, force_login=False):
@@ -400,7 +466,7 @@ def open_session(pw, cfg, app, interactive, login_timeout, force_login=False):
 
     if not interactive:
         raise Fail(EXIT_LOGIN, "An interactive login is needed. Run: splunk_query.py login")
-    log("Opening a Chrome window: log in and approve MFA if asked (waiting up to %ds)." % login_timeout)
+    log("Opening a browser window: log in and approve MFA if asked (waiting up to %ds)." % login_timeout)
     window = Session(pw, cfg, headless=False)
     try:
         window.interactive_login(app, login_timeout)
@@ -1147,7 +1213,7 @@ def cmd_logout(args):
             os.remove(path)
             removed.append(path)
     if args.all:
-        for path in (profile_dir(), profile_dir() + "-chromium"):
+        for path in [profile_dir(b) for b in BROWSERS]:
             if os.path.isdir(path):
                 shutil.rmtree(path)
                 removed.append(path)
@@ -1174,14 +1240,8 @@ def cmd_configure(args):
     if changed:
         if not data.get("url"):
             raise Fail(EXIT_CONFIG, "Pass --url as well: there is no saved URL yet.")
-        path = config_path()
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(data, fh, indent=2)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-        print("OK: saved %s" % path)
+        write_config(data)
+        print("OK: saved %s" % config_path())
     cfg = load_config(required=False)
     if cfg is None:
         raise Fail(EXIT_CONFIG, NOT_CONFIGURED)
@@ -1211,9 +1271,9 @@ def cmd_doctor(args, network=tcp_check):
             codes.append(code)
 
     if sys.version_info >= (3, 9):
-        line("OK", "Python %d.%d.%d" % sys.version_info[:3])
+        line("OK", "Python %d.%d.%d (%s)" % (sys.version_info[:3] + (sys.executable,)))
     else:
-        line("ERROR", "Python 3.9+ needed, found %d.%d" % sys.version_info[:2], EXIT_ERROR)
+        line("ERROR", "Python 3.9+ needed, found %d.%d" % sys.version_info[:2], EXIT_SETUP)
     if importlib.util.find_spec("playwright"):
         try:
             from importlib.metadata import version
@@ -1221,13 +1281,20 @@ def cmd_doctor(args, network=tcp_check):
         except Exception:
             line("OK", "playwright installed")
     else:
-        line("ERROR", "playwright missing: python3 -m pip install --user playwright", EXIT_ERROR)
-    chrome = "/Applications/Google Chrome.app"
-    if os.path.isdir(chrome) or any(shutil.which(n) for n in ("google-chrome", "google-chrome-stable", "chrome")):
-        line("OK", "Google Chrome found")
+        line("ERROR", "playwright missing: run setup", EXIT_SETUP)
+    try:
+        choice = configured_browser()
+    except Fail as exc:
+        line("ERROR", str(exc), EXIT_CONFIG)
+        choice = "auto"
+    found = [b for b in BROWSERS if browser_installed(b)]
+    line("OK" if found else "WARN", "browsers found: %s" % (", ".join(BROWSER_NAMES[b] for b in found) or "none"))
+    usable = found if choice == "auto" else [b for b in found if b == choice]
+    if usable:
+        line("OK", "browser to use: %s%s" % (BROWSER_NAMES[usable[0]], "" if choice == "auto" else " (configured)"))
     else:
-        line("WARN", "Google Chrome not found; falls back to Playwright Chromium (python3 -m playwright install chromium), "
-                     "which SSO device checks may reject")
+        line("ERROR", "no usable browser (%s): run setup, or install Google Chrome or Microsoft Edge"
+             % ("auto" if choice == "auto" else BROWSER_NAMES[choice]), EXIT_SETUP)
     try:
         cfg = load_config(args.app, required=False)
     except Fail as exc:
@@ -1268,6 +1335,63 @@ def cmd_doctor(args, network=tcp_check):
                 line("OK", "reached %s:443" % host)
     if codes:
         raise Fail(codes[0], "doctor found problems (see above).")
+
+
+def run_step(run, command, what, hint=""):
+    result = run(command)
+    if result.returncode != 0:
+        raise Fail(EXIT_SETUP, "Could not %s (exit %d): %s%s" % (what, result.returncode, " ".join(command), hint))
+
+
+def cmd_setup(args, run=subprocess.run):
+    """Install what the runner needs. Safe to run again: finished steps are skipped."""
+    if sys.version_info < (3, 9):
+        raise Fail(EXIT_SETUP, "Python 3.9 or newer is needed (found %d.%d)." % sys.version_info[:2])
+    python = sys.executable
+    if importlib.util.find_spec("playwright"):
+        print("[OK] playwright is installed for %s" % python)
+    else:
+        python = venv_python()
+        if not os.path.exists(python):
+            print("[..] creating a private Python environment in %s" % venv_dir(), flush=True)
+            os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+            run_step(run, [sys.executable, "-m", "venv", venv_dir()], "create the Python environment",
+                     " (on Debian or Ubuntu, install python3-venv first)")
+        print("[..] installing %s into it" % PLAYWRIGHT_REQUIREMENT, flush=True)
+        run_step(run, [python, "-m", "pip", "install", "--disable-pip-version-check", "--quiet", PLAYWRIGHT_REQUIREMENT],
+                 "install playwright")
+        print("[OK] playwright installed in %s" % venv_dir())
+    choice = (args.browser or configured_browser()).lower()
+    if choice == "auto":
+        browser = next((b for b in ("chrome", "msedge") if browser_installed(b)), "chromium")
+    else:
+        browser = choice
+    if browser != "chromium" and not browser_installed(browser):
+        raise Fail(EXIT_SETUP, "%s is not installed. Install it, or run: setup --browser chromium" % BROWSER_NAMES[browser])
+    if browser == "chromium" and not browser_installed("chromium"):
+        print("[..] downloading Playwright Chromium (about 150 MB)", flush=True)
+        run_step(run, [python, "-m", "playwright", "install", "chromium"], "download Chromium")
+    print("[OK] browser: %s" % BROWSER_NAMES[browser])
+    if args.browser:
+        data = read_config_file()
+        data["browser"] = browser
+        write_config(data)
+        print("[OK] saved browser choice to %s" % config_path())
+    if args.url:
+        cmd_configure(argparse.Namespace(url=args.url, app=args.app, locale=None))
+    elif load_config(required=False) is None:
+        print("Next: configure --url <a URL from the Splunk tab in your browser>")
+    print("Setup done. The first search opens a browser window once for the login.")
+
+
+def reexec_in_venv():
+    """Rerun this script with the skill's own Python environment when the current Python lacks Playwright."""
+    if importlib.util.find_spec("playwright") or not os.path.exists(venv_python()):
+        return
+    if os.environ.get("SPLUNK_QUERY_REEXEC") or os.path.abspath(sys.prefix) == os.path.abspath(venv_dir()):
+        return
+    os.environ["SPLUNK_QUERY_REEXEC"] = "1"
+    os.execv(venv_python(), [venv_python(), os.path.abspath(__file__)] + sys.argv[1:])
 
 
 def build_parser():
@@ -1327,6 +1451,12 @@ def build_parser():
     n.add_argument("--replace", action="store_true", help="add: overwrite a note with the same title")
     n.set_defaults(handler=cmd_notes)
 
+    st = sub.add_parser("setup", help="install Playwright, and Chromium when no Chrome or Edge is installed")
+    st.add_argument("--browser", choices=("auto",) + BROWSERS, help="browser to use (default auto: Chrome, Edge, Chromium)")
+    st.add_argument("--url", help="also configure the Splunk URL")
+    st.add_argument("--app", help="with --url: default app")
+    st.set_defaults(handler=cmd_setup)
+
     c = sub.add_parser("configure", help="save the Splunk URL, default app and locale")
     c.add_argument("--url", help="https://<instance>[/base-path]; a URL copied from Splunk Web also works")
     c.add_argument("--app", help="default app (default search)")
@@ -1365,4 +1495,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    reexec_in_venv()
     sys.exit(main())

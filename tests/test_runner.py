@@ -425,11 +425,157 @@ class DoctorTests(TempEnv):
         checked = []
         args = sq.build_parser().parse_args(["doctor"])
         out = io.StringIO()
-        with redirect_stdout(out), mock.patch.object(sq.importlib.util, "find_spec", return_value=True):
+        with redirect_stdout(out), mock.patch.object(sq.importlib.util, "find_spec", return_value=True), \
+                mock.patch.object(sq, "browser_installed", return_value=True):
             with self.assertRaises(sq.Fail) as ctx:
                 sq.cmd_doctor(args, network=lambda host: checked.append(host) or "DNS lookup failed")
         self.assertEqual(ctx.exception.code, sq.EXIT_VPN)
         self.assertEqual(checked, ["x.example.com", "login.idp.example.com"])
+
+
+class BrowserTests(TempEnv):
+    def test_auto_order_uses_installed_browsers(self):
+        with mock.patch.object(sq, "browser_installed", side_effect=lambda b: b in ("msedge", "chromium")):
+            self.assertEqual(sq.browser_order(), ["msedge", "chromium"])
+        with mock.patch.object(sq, "browser_installed", return_value=False):
+            self.assertEqual(sq.browser_order(), ["chromium"])
+
+    def test_configured_browser(self):
+        self.write_config({"url": "https://x.example.com", "browser": "msedge"})
+        self.assertEqual(sq.browser_order(), ["msedge"])
+        os.environ["SPLUNK_QUERY_BROWSER"] = "firefox"
+        with self.assertRaises(sq.Fail) as ctx:
+            sq.configured_browser()
+        self.assertEqual(ctx.exception.code, sq.EXIT_CONFIG)
+
+    def test_profiles_are_separate_per_browser(self):
+        dirs = {sq.profile_dir(b) for b in sq.BROWSERS}
+        self.assertEqual(len(dirs), 3)
+        self.assertTrue(sq.profile_dir().endswith("chrome-profile"))
+
+
+class FakeChromium:
+    def __init__(self, failures):
+        self.failures, self.calls = failures, []
+
+    def launch_persistent_context(self, path, **options):
+        self.calls.append((os.path.basename(path), options.get("channel")))
+        error = self.failures.get(options.get("channel") or "chromium")
+        if error:
+            raise sq.PwError(error)
+        return "ctx:" + os.path.basename(path)
+
+
+class LaunchTests(TempEnv):
+    def setUp(self):
+        super().setUp()
+        self.pw_error = mock.patch.object(sq, "PwError", RuntimeError)
+        self.pw_error.start()
+
+    def tearDown(self):
+        self.pw_error.stop()
+        super().tearDown()
+
+    def launch(self, failures, installed=("chrome", "msedge", "chromium")):
+        pw = mock.Mock()
+        pw.chromium = FakeChromium(failures)
+        with mock.patch.object(sq, "browser_installed", side_effect=lambda b: b in installed), \
+                redirect_stderr(io.StringIO()):
+            return pw.chromium, sq.launch(pw, headless=True)
+
+    def test_falls_back_to_next_browser(self):
+        chromium, ctx = self.launch({"chrome": "Executable doesn't exist"})
+        self.assertEqual(ctx, "ctx:msedge-profile")
+        self.assertEqual(chromium.calls, [("chrome-profile", "chrome"), ("msedge-profile", "msedge")])
+
+    def test_profile_in_use_stops(self):
+        with self.assertRaises(sq.Fail) as ctx:
+            self.launch({"chrome": "ProcessSingleton lock"})
+        self.assertEqual(ctx.exception.code, sq.EXIT_ERROR)
+
+    def test_no_browser_means_setup(self):
+        with self.assertRaises(sq.Fail) as ctx:
+            self.launch({"chromium": "Executable doesn't exist"}, installed=())
+        self.assertEqual(ctx.exception.code, sq.EXIT_SETUP)
+        self.assertIn("setup", str(ctx.exception))
+
+
+class SetupTests(TempEnv):
+    def setup(self, argv, has_playwright, installed, returncode=0):
+        commands = []
+
+        def run(command):
+            commands.append(command)
+            return mock.Mock(returncode=returncode)
+
+        args = sq.build_parser().parse_args(["setup"] + argv)
+        out = io.StringIO()
+        with redirect_stdout(out), \
+                mock.patch.object(sq.importlib.util, "find_spec", return_value=True if has_playwright else None), \
+                mock.patch.object(sq, "browser_installed", side_effect=lambda b: b in installed):
+            sq.cmd_setup(args, run=run)
+        return commands, out.getvalue()
+
+    def test_nothing_to_install(self):
+        commands, out = self.setup([], has_playwright=True, installed=("chrome",))
+        self.assertEqual(commands, [])
+        self.assertIn("browser: Google Chrome", out)
+        self.assertIn("Next: configure", out)
+
+    def test_installs_into_private_venv_and_downloads_chromium(self):
+        commands, out = self.setup([], has_playwright=False, installed=())
+        self.assertEqual(commands[0][1:], ["-m", "venv", sq.venv_dir()])
+        self.assertEqual(commands[1][0], sq.venv_python())
+        self.assertIn(sq.PLAYWRIGHT_REQUIREMENT, commands[1])
+        self.assertEqual(commands[2], [sq.venv_python(), "-m", "playwright", "install", "chromium"])
+        self.assertIn("browser: Playwright Chromium", out)
+
+    def test_explicit_browser_is_saved_with_url(self):
+        self.setup(["--browser", "msedge", "--url", "https://x.example.com/en-US/app/ops/search"],
+                   has_playwright=True, installed=("msedge",))
+        with open(os.environ["SPLUNK_QUERY_CONFIG"]) as fh:
+            data = json.load(fh)
+        self.assertEqual((data["browser"], data["url"], data["app"]), ("msedge", "https://x.example.com", "ops"))
+
+    def test_missing_explicit_browser_or_failed_step(self):
+        with self.assertRaises(sq.Fail) as ctx:
+            self.setup(["--browser", "chrome"], has_playwright=True, installed=())
+        self.assertEqual(ctx.exception.code, sq.EXIT_SETUP)
+        with self.assertRaises(sq.Fail) as ctx:
+            self.setup([], has_playwright=False, installed=(), returncode=1)
+        self.assertIn("python3-venv", str(ctx.exception))
+
+
+class ReexecTests(TempEnv):
+    def test_reexec_only_when_needed(self):
+        os.makedirs(os.path.dirname(sq.venv_python()))
+        open(sq.venv_python(), "w").close()
+        with mock.patch.object(sq.importlib.util, "find_spec", return_value=None), \
+                mock.patch.object(sq.os, "execv") as execv:
+            sq.reexec_in_venv()
+            self.assertEqual(execv.call_args[0][0], sq.venv_python())
+            self.assertEqual(os.environ.get("SPLUNK_QUERY_REEXEC"), "1")
+            execv.reset_mock()
+            sq.reexec_in_venv()
+            execv.assert_not_called()
+        with mock.patch.object(sq.importlib.util, "find_spec", return_value=True), \
+                mock.patch.object(sq.os, "execv") as execv:
+            os.environ.pop("SPLUNK_QUERY_REEXEC")
+            sq.reexec_in_venv()
+            execv.assert_not_called()
+
+
+class DoctorBrowserTests(TempEnv):
+    def test_no_browser_is_exit_6(self):
+        os.environ["SPLUNK_QUERY_URL"] = "https://x.example.com"
+        args = sq.build_parser().parse_args(["doctor"])
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch.object(sq.importlib.util, "find_spec", return_value=True), \
+                mock.patch.object(sq, "browser_installed", return_value=False):
+            with self.assertRaises(sq.Fail) as ctx:
+                sq.cmd_doctor(args, network=lambda host: None)
+        self.assertEqual(ctx.exception.code, sq.EXIT_SETUP)
+        self.assertIn("[ERROR] no usable browser", out.getvalue())
 
 
 if __name__ == "__main__":
