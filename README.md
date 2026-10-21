@@ -1,7 +1,8 @@
 # splunk-query
 
-An agent skill for Claude Code and Codex that runs Splunk searches from the terminal and
-gets better at your Splunk instance over time.
+An agent skill that runs Splunk searches from the terminal and gets better at your Splunk
+instance over time. Tested with Claude Code and Codex; other agents that support skills
+should work too (see [Install](#install)).
 
 - **Uses your browser login.** It runs searches through a dedicated profile of Chrome,
   Edge or Playwright's Chromium, so SSO and MFA happen once in a normal window; later runs
@@ -35,13 +36,40 @@ If your company's SSO only accepts a managed browser, install Chrome or Edge and
 
 ## Install
 
+Run the command for your agent. `DISABLE_TELEMETRY=1` turns off the installer's anonymous
+telemetry.
+
+### Claude Code
+
 ```bash
-DISABLE_TELEMETRY=1 npx skills add ndinhtoan47/splunk-query -g -a claude-code -a codex -y
+DISABLE_TELEMETRY=1 npx skills add ndinhtoan47/splunk-query -g -a claude-code -y
 ```
 
-`DISABLE_TELEMETRY=1` turns off the installer's anonymous telemetry.
+### Codex
 
-Then open Claude Code or Codex and ask:
+```bash
+DISABLE_TELEMETRY=1 npx skills add ndinhtoan47/splunk-query -g -a codex -y
+```
+
+### Other agents
+
+Change the `-a` value, for example:
+
+```bash
+DISABLE_TELEMETRY=1 npx skills add ndinhtoan47/splunk-query -g -a cursor -y
+```
+
+Or leave out `-a` and `-y` to choose from the agents found on your machine. The installer
+lists every agent it supports under
+[Supported Agents](https://github.com/vercel-labs/skills#supported-agents). Agents other
+than Claude Code and Codex are untested; the skill needs one that can run shell commands
+lasting a few minutes (a login waits up to 5), open a browser window and reach Splunk.
+
+To install for several agents at once, repeat `-a`: `-a claude-code -a codex`.
+
+## First question
+
+Open your agent and ask:
 
 ```text
 find me top 3 errors last 3 days
@@ -64,7 +92,7 @@ On the first question the agent:
 To do these steps yourself:
 
 ```bash
-S=~/.claude/skills/splunk-query/scripts/splunk_query.py
+S=~/.agents/skills/splunk-query/scripts/splunk_query.py
 python3 $S setup --url '<a URL from your Splunk tab>'
 python3 $S doctor
 python3 $S login
