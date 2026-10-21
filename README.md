@@ -41,13 +41,27 @@ DISABLE_TELEMETRY=1 npx skills add ndinhtoan47/splunk-query -g -a claude-code -a
 
 `DISABLE_TELEMETRY=1` turns off the installer's anonymous telemetry.
 
-## First use
+Then open Claude Code or Codex and ask:
 
-Ask your agent a Splunk question. On the first run it asks for your Splunk URL: paste any
-URL from your browser's Splunk tab. The agent runs `setup` if needed, then a browser window
-opens once for your login.
+```text
+find me top 3 errors last 3 days
+```
 
-To set it up yourself instead:
+That's all. The first time, the agent asks for your Splunk URL (paste any URL from your
+browser's Splunk tab), installs what it needs, and opens a browser window once for your
+login. After that, searches run in the background.
+
+## First run in detail
+
+You don't need this section: the agent does all of it for you. It's here if you want to
+know what happens, or prefer to set things up before your first question.
+
+On the first question the agent:
+1. asks for your Splunk URL and saves it;
+2. runs `setup` if Playwright or a usable browser is missing;
+3. opens a browser window for your login (SSO and MFA). Later runs reuse that session.
+
+To do these steps yourself:
 
 ```bash
 S=~/.claude/skills/splunk-query/scripts/splunk_query.py
@@ -78,16 +92,30 @@ Or export `SPLUNK_QUERY_URL` (and optionally `SPLUNK_QUERY_APP`) in your shell p
 Keep the notes and session files private: the notes name your indexes, fields and hosts,
 and the session folder holds live cookies.
 
-## Update and remove
+## Update
 
 ```bash
-DISABLE_TELEMETRY=1 npx skills check
-DISABLE_TELEMETRY=1 npx skills update splunk-query
+DISABLE_TELEMETRY=1 npx skills update splunk-query -g
+```
+
+## Uninstall
+
+```bash
 DISABLE_TELEMETRY=1 npx skills remove splunk-query -g
 ```
 
-Removing the skill leaves your settings, notes and session in place; delete
-`~/.config/splunk-query/` and `~/.cache/splunk-query/` for a full cleanup.
+Keep the `-g`: the skill is installed globally, and without it the installer looks only in
+the current folder and reports `Found 0 unique installed skill(s)`.
+
+This removes the skill but leaves your settings, notes and saved login on disk. To delete
+those too:
+
+```bash
+rm -rf ~/.config/splunk-query ~/.cache/splunk-query
+```
+
+`~/.config/splunk-query/` holds your notes of searches that worked; keep it if you might
+reinstall.
 
 ## Development
 
